@@ -118,8 +118,8 @@ fn read_first_page(
 }
 
 struct SelectParts<'a> {
-    target: &'a str,
-    table: &'a str,
+    targets: Vec<&'a str>, // one or more column names, or ["COUNT(*)"]
+    table:   &'a str,
 }
 
 fn parse_select(command: &str) -> Option<SelectParts<'_>> {
@@ -128,20 +128,32 @@ fn parse_select(command: &str) -> Option<SelectParts<'_>> {
     if !first.eq_ignore_ascii_case("select") {
         return None;
     }
-    let raw_target = parts.next()?;
-    let mut table_tok = None;
-    while let Some(token) = parts.next() {
-        if token.eq_ignore_ascii_case("from") {
+
+    // Collect tokens until we hit FROM
+    let mut before_from: Vec<&str> = Vec::new();
+    let mut table_tok: Option<&str> = None;
+    while let Some(tok) = parts.next() {
+        if tok.eq_ignore_ascii_case("from") {
             table_tok = parts.next();
             break;
         }
+        before_from.push(tok);
     }
     let table = table_tok?.trim_end_matches(';');
-    let target = raw_target.trim_end_matches(';');
-    if table.is_empty() || target.is_empty() {
+
+    // Targets may be split across tokens (e.g., "name,", "color"), so join & split by comma.
+    let targets_joined = before_from.join(" ");
+    let mut targets: Vec<&str> = targets_joined
+        .split(',')
+        .map(|s| s.trim().trim_end_matches(';'))
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    if table.is_empty() || targets.is_empty() {
         return None;
     }
-    Some(SelectParts { target, table })
+
+    Some(SelectParts { targets, table })
 }
 
 fn handle_select(select: SelectParts<'_>, db_path: &str) -> Result<()> {
@@ -204,14 +216,14 @@ fn handle_select(select: SelectParts<'_>, db_path: &str) -> Result<()> {
     let rootpage = match rootpage {
         Some(rp) => rp as usize,
         None => {
-            if select.target.eq_ignore_ascii_case("COUNT(*)") {
+            if select.targets.len() == 1 && select.targets[0].eq_ignore_ascii_case("COUNT(*)") {
                 println!("0");
             }
             return Ok(());
         }
     };
 
-    if select.target.eq_ignore_ascii_case("COUNT(*)") {
+    if select.targets.len() == 1 && select.targets[0].eq_ignore_ascii_case("COUNT(*)") {
         let page_start = (rootpage - 1) * page_size;
         let mut buf = vec![0u8; page_size];
         file.seek(SeekFrom::Start(page_start as u64))?;
@@ -225,10 +237,13 @@ fn handle_select(select: SelectParts<'_>, db_path: &str) -> Result<()> {
 
     let create_sql = create_sql.unwrap_or_default();
     let cols = parse_columns_from_create_sql(&create_sql);
-    let col_idx = cols
-        .iter()
-        .position(|c| c.eq_ignore_ascii_case(select.target))
-        .ok_or_else(|| anyhow::anyhow!(format!("column not found: {}", select.target)))?;
+    // Map requested targets to column indexes
+    let mut target_indexes: Vec<usize> = Vec::with_capacity(select.targets.len());
+    for t in &select.targets {
+        let idx = cols.iter().position(|c| c.eq_ignore_ascii_case(t))
+            .ok_or_else(|| anyhow::anyhow!(format!("column not found: {}", t)))?;
+        target_indexes.push(idx);
+    }
 
     let page_start = (rootpage - 1) * page_size;
     let mut buf = vec![0u8; page_size];
@@ -264,15 +279,25 @@ fn handle_select(select: SelectParts<'_>, db_path: &str) -> Result<()> {
         }
         let body_start = cur;
 
-        let mut body_idx = body_start;
-        for serial in &serials[..col_idx] {
-            body_idx += serial_type_size(*serial);
+        // Precompute offsets for each column within the record body
+        let mut offsets: Vec<usize> = Vec::with_capacity(serials.len());
+        let mut acc = 0usize;
+        for s in &serials {
+            offsets.push(acc);
+            acc += serial_type_size(*s);
         }
-        let field_size = serial_type_size(serials[col_idx]);
-        let field_bytes = &buf[body_idx..body_idx + field_size];
 
-        let val = std::str::from_utf8(field_bytes)?.to_owned();
-        out_lines.push(val);
+        // Collect requested columns
+        let mut row_fields: Vec<String> = Vec::with_capacity(target_indexes.len());
+        for &tidx in &target_indexes {
+            let start = body_start + offsets[tidx];
+            let len = serial_type_size(serials[tidx]);
+            let bytes = &buf[start..start + len];
+            // For this stage we expect TEXT columns
+            let v = std::str::from_utf8(bytes)?.to_owned();
+            row_fields.push(v);
+        }
+        out_lines.push(row_fields.join("|"));
     }
 
     for line in out_lines {

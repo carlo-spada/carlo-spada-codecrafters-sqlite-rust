@@ -117,6 +117,14 @@ fn read_first_page(
     Ok(page)
 }
 
+fn read_page(file: &mut File, page_size: usize, page_number: usize) -> Result<Vec<u8>> {
+    let mut page = vec![0u8; page_size];
+    let offset = (page_number - 1) * page_size;
+    file.seek(SeekFrom::Start(offset as u64))?;
+    file.read_exact(&mut page)?;
+    Ok(page)
+}
+
 fn strip_surrounding_quotes(input: &str) -> String {
     let trimmed = input.trim();
     if trimmed.len() >= 2 {
@@ -269,20 +277,6 @@ fn handle_select(select: SelectParts, db_path: &str) -> Result<()> {
         }
     };
 
-    let filter_ref = filter.as_ref();
-
-    if is_count && filter_ref.is_none() {
-        let page_start = (rootpage - 1) * page_size;
-        let mut buf = vec![0u8; page_size];
-        file.seek(SeekFrom::Start(page_start as u64))?;
-        file.read_exact(&mut buf)?;
-
-        let ph_off = if rootpage == 1 { HEADER_SIZE } else { 0 };
-        let row_count = u16::from_be_bytes([buf[ph_off + 3], buf[ph_off + 4]]) as u64;
-        println!("{}", row_count);
-        return Ok(());
-    }
-
     let create_sql = create_sql.unwrap_or_default();
     let cols = parse_columns_from_create_sql(&create_sql);
     let target_lowers: Vec<String> = targets.iter().map(|t| t.to_ascii_lowercase()).collect();
@@ -298,6 +292,7 @@ fn handle_select(select: SelectParts, db_path: &str) -> Result<()> {
         }
     }
 
+    let filter_ref = filter.as_ref();
     let filter_idx = if let Some(f) = filter_ref {
         Some(
             cols.iter()
@@ -309,88 +304,177 @@ fn handle_select(select: SelectParts, db_path: &str) -> Result<()> {
     };
     let filter_spec = filter_ref.zip(filter_idx);
 
-    let page_start = (rootpage - 1) * page_size;
-    let mut buf = vec![0u8; page_size];
-    file.seek(SeekFrom::Start(page_start as u64))?;
-    file.read_exact(&mut buf)?;
-
-    let ph_off = if rootpage == 1 { HEADER_SIZE } else { 0 };
-    let row_cells = u16::from_be_bytes([buf[ph_off + 3], buf[ph_off + 4]]) as usize;
-    let ptr_base = ph_off + PAGE_HEADER_SIZE;
-
+    let mut rows: Vec<String> = Vec::new();
+    let mut count_matches = 0u64;
     let mut serials = vec![0u64; cols.len()];
     let mut offsets = vec![0usize; cols.len()];
-    let mut count_matches = 0u64;
 
-    for i in 0..row_cells {
-        let off_idx = ptr_base + i * 2;
-        let cell_off = u16::from_be_bytes([buf[off_idx], buf[off_idx + 1]]) as usize;
-        let mut idx = cell_off;
-
-        let (_, n1) = read_varint(&buf, idx);
-        idx = n1;
-        let (_, n2) = read_varint(&buf, idx);
-        idx = n2;
-
-        let (hdr_sz, hdr_next) = read_varint(&buf, idx);
-        let hdr_sz = hdr_sz as usize;
-        let mut cur = hdr_next;
-        let mut consumed = cur - idx;
-        let mut serials_len = 0usize;
-        while consumed < hdr_sz && serials_len < serials.len() {
-            let (code, nxt) = read_varint(&buf, cur);
-            serials[serials_len] = code;
-            serials_len += 1;
-            consumed += nxt - cur;
-            cur = nxt;
-        }
-        let body_start = cur;
-
-        let mut acc = 0usize;
-        for j in 0..serials_len {
-            offsets[j] = acc;
-            acc += serial_type_size(serials[j]);
-        }
-
-        if let Some((filter, filter_idx)) = filter_spec {
-            if filter_idx >= serials_len {
-                continue;
-            }
-            let offset = offsets[filter_idx];
-            let len = serial_type_size(serials[filter_idx]);
-            let start = body_start + offset;
-            let end = start + len;
-            let value = std::str::from_utf8(&buf[start..end])?;
-            if value != filter.value {
-                continue;
-            }
-        }
-
-        if is_count {
-            count_matches += 1;
-            continue;
-        }
-
-        let mut row_line = String::new();
-        for (pos, &tidx) in target_indexes.iter().enumerate() {
-            if tidx >= serials_len {
-                continue;
-            }
-            let offset = offsets[tidx];
-            let len = serial_type_size(serials[tidx]);
-            let start = body_start + offset;
-            let end = start + len;
-            let value = std::str::from_utf8(&buf[start..end])?;
-            if pos > 0 {
-                row_line.push('|');
-            }
-            row_line.push_str(value);
-        }
-        println!("{}", row_line);
-    }
+    traverse_table_btree(
+        &mut file,
+        page_size,
+        rootpage,
+        &cols,
+        filter_spec,
+        is_count,
+        &target_indexes,
+        &mut serials,
+        &mut offsets,
+        &mut rows,
+        &mut count_matches,
+    )?;
 
     if is_count {
         println!("{}", count_matches);
+    } else {
+        for line in rows {
+            println!("{}", line);
+        }
+    }
+
+    Ok(())
+}
+
+fn traverse_table_btree(
+    file: &mut File,
+    page_size: usize,
+    page_number: usize,
+    cols: &[String],
+    filter_spec: Option<(&Filter, usize)>,
+    is_count: bool,
+    target_indexes: &[usize],
+    serials: &mut [u64],
+    offsets: &mut [usize],
+    rows: &mut Vec<String>,
+    count_matches: &mut u64,
+) -> Result<()> {
+    let page = read_page(file, page_size, page_number)?;
+
+    let header_offset = if page_number == 1 { HEADER_SIZE } else { 0 };
+    let page_type = page[header_offset];
+    let cell_count = u16::from_be_bytes([page[header_offset + 3], page[header_offset + 4]]) as usize;
+    let header_size = if page_type == 0x05 { 12 } else { 8 };
+    let pointer_base = header_offset + header_size;
+
+    match page_type {
+        0x05 => {
+            // Interior table b-tree page
+            for i in 0..cell_count {
+                let offset_idx = pointer_base + i * 2;
+                let cell_offset = u16::from_be_bytes([page[offset_idx], page[offset_idx + 1]]) as usize;
+                let child_page = u32::from_be_bytes([
+                    page[cell_offset],
+                    page[cell_offset + 1],
+                    page[cell_offset + 2],
+                    page[cell_offset + 3],
+                ]) as usize;
+                traverse_table_btree(
+                    file,
+                    page_size,
+                    child_page,
+                    cols,
+                    filter_spec,
+                    is_count,
+                    target_indexes,
+                    serials,
+                    offsets,
+                    rows,
+                    count_matches,
+                )?;
+            }
+            // Right-most child
+            let right_most = u32::from_be_bytes([
+                page[header_offset + 8],
+                page[header_offset + 9],
+                page[header_offset + 10],
+                page[header_offset + 11],
+            ]) as usize;
+            if right_most != 0 {
+                traverse_table_btree(
+                    file,
+                    page_size,
+                    right_most,
+                    cols,
+                    filter_spec,
+                    is_count,
+                    target_indexes,
+                    serials,
+                    offsets,
+                    rows,
+                    count_matches,
+                )?;
+            }
+        }
+        0x0D => {
+            // Leaf table b-tree page
+            for i in 0..cell_count {
+                let offset_idx = pointer_base + i * 2;
+                let cell_offset = u16::from_be_bytes([page[offset_idx], page[offset_idx + 1]]) as usize;
+                let mut idx = cell_offset;
+
+                let (_, next) = read_varint(&page, idx);
+                idx = next;
+                let (_, next) = read_varint(&page, idx);
+                idx = next;
+
+                let (hdr_sz, hdr_next) = read_varint(&page, idx);
+                let hdr_sz = hdr_sz as usize;
+                let mut cur = hdr_next;
+                let mut consumed = cur - idx;
+                let mut serials_len = 0usize;
+                while consumed < hdr_sz && serials_len < serials.len() {
+                    let (code, nxt) = read_varint(&page, cur);
+                    serials[serials_len] = code;
+                    serials_len += 1;
+                    consumed += nxt - cur;
+                    cur = nxt;
+                }
+                let body_start = cur;
+
+                let mut acc = 0usize;
+                for j in 0..serials_len {
+                    offsets[j] = acc;
+                    acc += serial_type_size(serials[j]);
+                }
+
+                if let Some((filter, filter_idx)) = filter_spec {
+                    if filter_idx >= serials_len {
+                        continue;
+                    }
+                    let offset = offsets[filter_idx];
+                    let len = serial_type_size(serials[filter_idx]);
+                    let start = body_start + offset;
+                    let end = start + len;
+                    let value = std::str::from_utf8(&page[start..end])?;
+                    if value != filter.value.as_str() {
+                        continue;
+                    }
+                }
+
+                if is_count {
+                    *count_matches += 1;
+                } else {
+                    let mut row_line = String::new();
+                    for (pos, &tidx) in target_indexes.iter().enumerate() {
+                        if tidx >= serials_len {
+                            continue;
+                        }
+                        let offset = offsets[tidx];
+                        let len = serial_type_size(serials[tidx]);
+                        let start = body_start + offset;
+                        let end = start + len;
+                        let value = std::str::from_utf8(&page[start..end])?;
+                        if pos > 0 {
+                            row_line.push('|');
+                        }
+                        row_line.push_str(value);
+                    }
+                    rows.push(row_line);
+                }
+            }
+        }
+        _ => {
+            bail!("Unsupported page type: {:#x}", page_type);
+        }
     }
 
     Ok(())

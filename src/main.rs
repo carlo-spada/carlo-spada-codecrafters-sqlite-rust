@@ -139,14 +139,35 @@ fn strip_surrounding_quotes(input: &str) -> String {
 }
 
 struct SelectParts {
-    targets: Vec<String>, // one or more column names, or ["COUNT(*)"]
+    targets: Vec<TargetSpec>, // one or more column names, or ["COUNT(*)"]
     table: String,
     filter: Option<Filter>,
+}
+
+struct TargetSpec {
+    original: String,
+    lower: String,
 }
 
 struct Filter {
     column_lower: String,
     value: String,
+}
+
+struct ColumnSpec {
+    name_lower: String,
+    is_rowid_alias: bool,
+}
+
+#[derive(Clone, Copy)]
+enum ColumnAccess {
+    RowId,
+    Payload(usize),
+}
+
+enum RowMode<'a> {
+    Count(&'a mut u64),
+    Print { buf: &'a mut String, sink: &'a mut dyn FnMut(&str) },
 }
 
 fn parse_select(command: &str) -> Option<SelectParts> {
@@ -170,11 +191,16 @@ fn parse_select(command: &str) -> Option<SelectParts> {
 
     // Targets may be split across tokens (e.g., "name,", "color"), so join & split by comma.
     let targets_joined = before_from.join(" ");
-    let targets: Vec<String> = targets_joined
-        .split(',')
-        .map(|s| s.trim().trim_end_matches(';').to_string())
-        .filter(|s| !s.is_empty())
-        .collect();
+    let mut targets: Vec<TargetSpec> = Vec::new();
+    for raw in targets_joined.split(',') {
+        let trimmed = raw.trim().trim_end_matches(';');
+        if trimmed.is_empty() {
+            continue;
+        }
+        let original = trimmed.to_string();
+        let lower = original.to_ascii_lowercase();
+        targets.push(TargetSpec { original, lower });
+    }
 
     // Parse optional WHERE clause from remaining tokens
     let remaining_tokens: Vec<&str> = parts.collect();
@@ -209,7 +235,7 @@ fn parse_select(command: &str) -> Option<SelectParts> {
 
 fn handle_select(select: SelectParts, db_path: &str) -> Result<()> {
     let SelectParts { targets, table, filter } = select;
-    let is_count = targets.len() == 1 && targets[0].eq_ignore_ascii_case("COUNT(*)");
+    let is_count = targets.len() == 1 && targets[0].lower == "count(*)";
 
     let (mut file, header) = open_db(db_path)?;
     let page_size = page_size_from_header(&header);
@@ -278,57 +304,76 @@ fn handle_select(select: SelectParts, db_path: &str) -> Result<()> {
     };
 
     let create_sql = create_sql.unwrap_or_default();
-    let cols = parse_columns_from_create_sql(&create_sql);
-    let target_lowers: Vec<String> = targets.iter().map(|t| t.to_ascii_lowercase()).collect();
+    let col_specs = parse_columns_from_create_sql(&create_sql);
+    let physical_count = col_specs.iter().filter(|c| !c.is_rowid_alias).count();
+    let mut logical_to_physical = Vec::with_capacity(col_specs.len());
+    let mut next_physical = 0usize;
+    for spec in &col_specs {
+        if spec.is_rowid_alias {
+            logical_to_physical.push(None);
+        } else {
+            logical_to_physical.push(Some(next_physical));
+            next_physical += 1;
+        }
+    }
 
-    // Map requested targets to column indexes
-    let mut target_indexes: Vec<usize> = Vec::new();
+    let mut target_accesses: Vec<ColumnAccess> = Vec::new();
     if !is_count {
-        target_indexes.reserve(target_lowers.len());
-        for (original, lower) in targets.iter().zip(target_lowers.iter()) {
-            let idx = cols.iter().position(|c| c == lower)
-                .ok_or_else(|| anyhow::anyhow!(format!("column not found: {}", original)))?;
-            target_indexes.push(idx);
+        target_accesses.reserve(targets.len());
+        for target in &targets {
+            let logical_idx = col_specs.iter()
+                .position(|c| c.name_lower == target.lower)
+                .ok_or_else(|| anyhow::anyhow!(format!("column not found: {}", target.original)))?;
+            let access = match logical_to_physical[logical_idx] {
+                Some(p) => ColumnAccess::Payload(p),
+                None => ColumnAccess::RowId,
+            };
+            target_accesses.push(access);
         }
     }
 
     let filter_ref = filter.as_ref();
-    let filter_idx = if let Some(f) = filter_ref {
-        Some(
-            cols.iter()
-                .position(|c| c == &f.column_lower)
-                .ok_or_else(|| anyhow::anyhow!(format!("column not found: {}", f.column_lower)))?,
-        )
+    let filter_spec = if let Some(f) = filter_ref {
+        let logical_idx = col_specs.iter()
+            .position(|c| c.name_lower == f.column_lower)
+            .ok_or_else(|| anyhow::anyhow!(format!("column not found: {}", f.column_lower)))?;
+        let access = match logical_to_physical[logical_idx] {
+            Some(p) => ColumnAccess::Payload(p),
+            None => ColumnAccess::RowId,
+        };
+        Some((f, access))
     } else {
         None
     };
-    let filter_spec = filter_ref.zip(filter_idx);
 
-    let mut rows: Vec<String> = Vec::new();
+    let mut serials = vec![0u64; physical_count];
+    let mut offsets = vec![0usize; physical_count];
     let mut count_matches = 0u64;
-    let mut serials = vec![0u64; cols.len()];
-    let mut offsets = vec![0usize; cols.len()];
+    let mut line_buf = String::new();
+    let mut printer = |line: &str| println!("{}", line);
+    let mut row_mode = if is_count {
+        RowMode::Count(&mut count_matches)
+    } else {
+        RowMode::Print {
+            buf: &mut line_buf,
+            sink: &mut printer,
+        }
+    };
 
     traverse_table_btree(
         &mut file,
         page_size,
         rootpage,
-        &cols,
         filter_spec,
-        is_count,
-        &target_indexes,
+        &logical_to_physical,
         &mut serials,
         &mut offsets,
-        &mut rows,
-        &mut count_matches,
+        target_accesses.as_slice(),
+        &mut row_mode,
     )?;
 
     if is_count {
         println!("{}", count_matches);
-    } else {
-        for line in rows {
-            println!("{}", line);
-        }
     }
 
     Ok(())
@@ -338,14 +383,12 @@ fn traverse_table_btree(
     file: &mut File,
     page_size: usize,
     page_number: usize,
-    cols: &[String],
-    filter_spec: Option<(&Filter, usize)>,
-    is_count: bool,
-    target_indexes: &[usize],
+    filter_spec: Option<(&Filter, ColumnAccess)>,
+    logical_to_physical: &[Option<usize>],
     serials: &mut [u64],
     offsets: &mut [usize],
-    rows: &mut Vec<String>,
-    count_matches: &mut u64,
+    target_accesses: &[ColumnAccess],
+    row_mode: &mut RowMode,
 ) -> Result<()> {
     let page = read_page(file, page_size, page_number)?;
 
@@ -357,7 +400,6 @@ fn traverse_table_btree(
 
     match page_type {
         0x05 => {
-            // Interior table b-tree page
             for i in 0..cell_count {
                 let offset_idx = pointer_base + i * 2;
                 let cell_offset = u16::from_be_bytes([page[offset_idx], page[offset_idx + 1]]) as usize;
@@ -371,17 +413,15 @@ fn traverse_table_btree(
                     file,
                     page_size,
                     child_page,
-                    cols,
                     filter_spec,
-                    is_count,
-                    target_indexes,
+                    logical_to_physical,
                     serials,
                     offsets,
-                    rows,
-                    count_matches,
+                    target_accesses,
+                    row_mode,
                 )?;
             }
-            // Right-most child
+
             let right_most = u32::from_be_bytes([
                 page[header_offset + 8],
                 page[header_offset + 9],
@@ -393,19 +433,16 @@ fn traverse_table_btree(
                     file,
                     page_size,
                     right_most,
-                    cols,
                     filter_spec,
-                    is_count,
-                    target_indexes,
+                    logical_to_physical,
                     serials,
                     offsets,
-                    rows,
-                    count_matches,
+                    target_accesses,
+                    row_mode,
                 )?;
             }
         }
         0x0D => {
-            // Leaf table b-tree page
             for i in 0..cell_count {
                 let offset_idx = pointer_base + i * 2;
                 let cell_offset = u16::from_be_bytes([page[offset_idx], page[offset_idx + 1]]) as usize;
@@ -413,62 +450,97 @@ fn traverse_table_btree(
 
                 let (_, next) = read_varint(&page, idx);
                 idx = next;
-                let (_, next) = read_varint(&page, idx);
+                let (rowid, next) = read_varint(&page, idx);
                 idx = next;
 
                 let (hdr_sz, hdr_next) = read_varint(&page, idx);
                 let hdr_sz = hdr_sz as usize;
                 let mut cur = hdr_next;
                 let mut consumed = cur - idx;
-                let mut serials_len = 0usize;
-                while consumed < hdr_sz && serials_len < serials.len() {
+                let mut logical_idx = 0usize;
+                while consumed < hdr_sz && logical_idx < logical_to_physical.len() {
                     let (code, nxt) = read_varint(&page, cur);
-                    serials[serials_len] = code;
-                    serials_len += 1;
+                    if let Some(pidx) = logical_to_physical[logical_idx] {
+                        if pidx < serials.len() {
+                            serials[pidx] = code;
+                        }
+                    }
                     consumed += nxt - cur;
                     cur = nxt;
+                    logical_idx += 1;
                 }
                 let body_start = cur;
 
                 let mut acc = 0usize;
-                for j in 0..serials_len {
-                    offsets[j] = acc;
-                    acc += serial_type_size(serials[j]);
-                }
-
-                if let Some((filter, filter_idx)) = filter_spec {
-                    if filter_idx >= serials_len {
-                        continue;
-                    }
-                    let offset = offsets[filter_idx];
-                    let len = serial_type_size(serials[filter_idx]);
-                    let start = body_start + offset;
-                    let end = start + len;
-                    let value = std::str::from_utf8(&page[start..end])?;
-                    if value != filter.value.as_str() {
-                        continue;
+                for opt in logical_to_physical.iter() {
+                    if let Some(pidx) = *opt {
+                        offsets[pidx] = acc;
+                        acc += serial_type_size(serials[pidx]);
                     }
                 }
 
-                if is_count {
-                    *count_matches += 1;
-                } else {
-                    let mut row_line = String::new();
-                    for (pos, &tidx) in target_indexes.iter().enumerate() {
-                        if tidx >= serials_len {
-                            continue;
+                let mut rowid_string: Option<String> = None;
+
+                if let Some((filter, access)) = filter_spec {
+                    let matches = match access {
+                        ColumnAccess::RowId => {
+                            let rid = rowid_string.get_or_insert_with(|| rowid.to_string());
+                            filter.value == rid.as_str()
                         }
-                        let offset = offsets[tidx];
-                        let len = serial_type_size(serials[tidx]);
-                        let start = body_start + offset;
-                        let end = start + len;
-                        let value = std::str::from_utf8(&page[start..end])?;
-                        if pos > 0 {
-                            row_line.push('|');
+                        ColumnAccess::Payload(pidx) => {
+                            if pidx >= serials.len() {
+                                false
+                            } else {
+                                let offset = offsets[pidx];
+                                let len = serial_type_size(serials[pidx]);
+                                let start = body_start + offset;
+                                let value =
+                                    decode_serial_value(serials[pidx], &page, start, len)?;
+                                value == filter.value
+                            }
                         }
-                        row_line.push_str(value);
+                    };
+                    if !matches {
+                        continue;
                     }
-                    rows.push(row_line);
+                }
+
+                match row_mode {
+                    RowMode::Count(count) => {
+                        **count += 1;
+                    }
+                    RowMode::Print { buf, sink } => {
+                        buf.clear();
+                        for (pos, access) in target_accesses.iter().enumerate() {
+                            if pos > 0 {
+                                buf.push('|');
+                            }
+                            match *access {
+                                ColumnAccess::RowId => {
+                                    let rid = rowid_string
+                                        .get_or_insert_with(|| rowid.to_string());
+                                    buf.push_str(rid);
+                                }
+                                ColumnAccess::Payload(pidx) => {
+                                    if pidx >= serials.len() {
+                                        // treat missing as NULL
+                                    } else {
+                                        let offset = offsets[pidx];
+                                        let len = serial_type_size(serials[pidx]);
+                                        let start = body_start + offset;
+                                        let value = decode_serial_value(
+                                            serials[pidx],
+                                            &page,
+                                            start,
+                                            len,
+                                        )?;
+                                        buf.push_str(&value);
+                                    }
+                                }
+                            }
+                        }
+                        (sink)(buf.as_str());
+                    }
                 }
             }
         }
@@ -532,26 +604,159 @@ fn read_signed_be_int(bytes: &[u8]) -> i64 {
     (v << shift) >> shift
 }
 
-fn parse_columns_from_create_sql(sql: &str) -> Vec<String> {
-    // Very naive: find the first '(' ... last ')' and split by commas at the top level.
-    // Then take the first token of each segment as the column name, skipping table constraints.
+fn parse_columns_from_create_sql(sql: &str) -> Vec<ColumnSpec> {
     let mut cols = Vec::new();
     let open = match sql.find('(') { Some(i) => i, None => return cols };
     let close = match sql.rfind(')') { Some(i) if i > open => i, _ => return cols };
-    let inner = &sql[open+1..close];
-    for raw in inner.split(',') {
-        let part = raw.trim();
-        if part.is_empty() { continue; }
-        // first token is candidate column name
-        let mut it = part.split_whitespace();
-        if let Some(tok) = it.next() {
-            let lower = tok.trim_matches(|c: char| c == '"' || c == '`' || c == '[' || c == ']').to_lowercase();
-            // skip common table constraints
-            match lower.as_str() {
-                "primary" | "foreign" | "unique" | "check" | "constraint" => continue,
-                _ => cols.push(lower),
+    let inner = &sql[open + 1..close];
+    let mut parts: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut depth = 0usize;
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut chars = inner.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\'' if !in_double => {
+                current.push(ch);
+                if in_single {
+                    if chars.peek() == Some(&'\'') {
+                        current.push(chars.next().unwrap());
+                    } else {
+                        in_single = false;
+                    }
+                } else {
+                    in_single = true;
+                }
+            }
+            '"' if !in_single => {
+                current.push(ch);
+                if in_double {
+                    if chars.peek() == Some(&'"') {
+                        current.push(chars.next().unwrap());
+                    } else {
+                        in_double = false;
+                    }
+                } else {
+                    in_double = true;
+                }
+            }
+            '(' if !in_single && !in_double => {
+                depth += 1;
+                current.push(ch);
+            }
+            ')' if !in_single && !in_double => {
+                if depth > 0 {
+                    depth -= 1;
+                }
+                current.push(ch);
+            }
+            ',' if depth == 0 && !in_single && !in_double => {
+                if !current.trim().is_empty() {
+                    parts.push(current.trim().to_string());
+                }
+                current.clear();
+            }
+            _ => current.push(ch),
+        }
+    }
+
+    if !current.trim().is_empty() {
+        parts.push(current.trim().to_string());
+    }
+
+    for part in parts {
+        let trimmed = part.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        let (name_token, _rest_start) = extract_column_name_token(trimmed);
+        if name_token.is_empty() {
+            continue;
+        }
+
+        let unquoted = name_token.trim_matches(|c: char| c == '"' || c == '`' || c == '[' || c == ']');
+        let name_lower = unquoted.to_ascii_lowercase();
+        match name_lower.as_str() {
+            "primary" | "foreign" | "unique" | "check" | "constraint" => continue,
+            _ => {
+                let upper_part = trimmed.to_ascii_uppercase();
+                let is_rowid_alias =
+                    upper_part.contains("PRIMARY KEY") && upper_part.contains("INTEGER");
+                cols.push(ColumnSpec {
+                    name_lower,
+                    is_rowid_alias,
+                });
             }
         }
     }
+
     cols
+}
+
+fn extract_column_name_token(def: &str) -> (&str, usize) {
+    let trimmed = def.trim_start();
+    let offset = def.len() - trimmed.len();
+    let bytes = trimmed.as_bytes();
+    if bytes.is_empty() {
+        return ("", def.len());
+    }
+
+    let first = bytes[0] as char;
+    if matches!(first, '"' | '`' | '[') {
+        let closing = if first == '[' { ']' } else { first };
+        let mut chars = trimmed[first.len_utf8()..].char_indices();
+        while let Some((pos, ch)) = chars.next() {
+            if ch == closing {
+                let end = first.len_utf8() + pos + ch.len_utf8();
+                return (&trimmed[..end], offset + end);
+            }
+        }
+        (trimmed, def.len())
+    } else {
+        let mut end = trimmed.len();
+        for (pos, ch) in trimmed.char_indices() {
+            if pos == 0 {
+                continue;
+            }
+            if ch.is_whitespace() || ch == '(' {
+                end = pos;
+                break;
+            }
+        }
+        (&trimmed[..end], offset + end)
+    }
+}
+
+fn decode_serial_value(serial: u64, page: &[u8], start: usize, len: usize) -> Result<String> {
+    match serial {
+        0 => Ok(String::new()),
+        1 | 2 | 3 | 4 | 5 | 6 => {
+            let value = read_signed_be_int(&page[start..start + len]);
+            Ok(value.to_string())
+        }
+        7 => {
+            let bytes = &page[start..start + len];
+            if bytes.len() != 8 {
+                bail!("Invalid float length {}", bytes.len());
+            }
+            let mut arr = [0u8; 8];
+            arr.copy_from_slice(bytes);
+            let value = f64::from_be_bytes(arr);
+            Ok(value.to_string())
+        }
+        8 => Ok("0".to_string()),
+        9 => Ok("1".to_string()),
+        n if n >= 12 && n % 2 == 0 => {
+            let bytes = &page[start..start + len];
+            Ok(bytes.iter().map(|b| format!("{:02x}", b)).collect())
+        }
+        n if n >= 13 && n % 2 == 1 => {
+            let bytes = &page[start..start + len];
+            Ok(std::str::from_utf8(bytes)?.to_string())
+        }
+        _ => bail!("Unsupported serial type {}", serial),
+    }
 }

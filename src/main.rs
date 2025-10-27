@@ -117,9 +117,28 @@ fn read_first_page(
     Ok(page)
 }
 
+fn strip_surrounding_quotes(input: &str) -> String {
+    let trimmed = input.trim();
+    if trimmed.len() >= 2 {
+        let bytes = trimmed.as_bytes();
+        let first = bytes[0];
+        let last = bytes[trimmed.len() - 1];
+        if (first == last) && (first == b'\'' || first == b'"') {
+            return trimmed[1..trimmed.len() - 1].to_string();
+        }
+    }
+    trimmed.to_string()
+}
+
 struct SelectParts {
     targets: Vec<String>, // one or more column names, or ["COUNT(*)"]
-    table:   String,
+    table: String,
+    filter: Option<Filter>,
+}
+
+struct Filter {
+    column_lower: String,
+    value: String,
 }
 
 fn parse_select(command: &str) -> Option<SelectParts> {
@@ -149,14 +168,41 @@ fn parse_select(command: &str) -> Option<SelectParts> {
         .filter(|s| !s.is_empty())
         .collect();
 
+    // Parse optional WHERE clause from remaining tokens
+    let remaining_tokens: Vec<&str> = parts.collect();
+    let mut filter = None;
+    if !remaining_tokens.is_empty() {
+        if remaining_tokens[0].eq_ignore_ascii_case("where") {
+            let condition = remaining_tokens[1..].join(" ");
+            let condition = condition.trim();
+            if !condition.is_empty() {
+                let condition = condition.trim_end_matches(';');
+                let mut eq_split = condition.splitn(2, '=');
+                let column = eq_split.next()?.trim();
+                let value_raw = eq_split.next()?.trim();
+                if column.is_empty() || value_raw.is_empty() {
+                    return None;
+                }
+                let value = strip_surrounding_quotes(value_raw);
+                filter = Some(Filter {
+                    column_lower: column.to_ascii_lowercase(),
+                    value,
+                });
+            }
+        }
+    }
+
     if table.is_empty() || targets.is_empty() {
         return None;
     }
 
-    Some(SelectParts { targets, table })
+    Some(SelectParts { targets, table, filter })
 }
 
 fn handle_select(select: SelectParts, db_path: &str) -> Result<()> {
+    let SelectParts { targets, table, filter } = select;
+    let is_count = targets.len() == 1 && targets[0].eq_ignore_ascii_case("COUNT(*)");
+
     let (mut file, header) = open_db(db_path)?;
     let page_size = page_size_from_header(&header);
     let page1 = read_first_page(&mut file, &header, page_size)?;
@@ -206,7 +252,7 @@ fn handle_select(select: SelectParts, db_path: &str) -> Result<()> {
         let sql_bytes = &page1[body_idx..body_idx + sql_len];
         let sql = std::str::from_utf8(sql_bytes)?.to_owned();
 
-        if tbl_name.eq_ignore_ascii_case(select.table.as_str()) {
+        if tbl_name.eq_ignore_ascii_case(table.as_str()) {
             rootpage = Some(rp);
             create_sql = Some(sql);
             break;
@@ -216,14 +262,16 @@ fn handle_select(select: SelectParts, db_path: &str) -> Result<()> {
     let rootpage = match rootpage {
         Some(rp) => rp as usize,
         None => {
-            if select.targets.len() == 1 && select.targets[0].eq_ignore_ascii_case("COUNT(*)") {
+            if is_count {
                 println!("0");
             }
             return Ok(());
         }
     };
 
-    if select.targets.len() == 1 && select.targets[0].eq_ignore_ascii_case("COUNT(*)") {
+    let filter_ref = filter.as_ref();
+
+    if is_count && filter_ref.is_none() {
         let page_start = (rootpage - 1) * page_size;
         let mut buf = vec![0u8; page_size];
         file.seek(SeekFrom::Start(page_start as u64))?;
@@ -237,13 +285,29 @@ fn handle_select(select: SelectParts, db_path: &str) -> Result<()> {
 
     let create_sql = create_sql.unwrap_or_default();
     let cols = parse_columns_from_create_sql(&create_sql);
+    let target_lowers: Vec<String> = targets.iter().map(|t| t.to_ascii_lowercase()).collect();
+
     // Map requested targets to column indexes
-    let mut target_indexes: Vec<usize> = Vec::with_capacity(select.targets.len());
-    for t in &select.targets {
-        let idx = cols.iter().position(|c| c.eq_ignore_ascii_case(t))
-            .ok_or_else(|| anyhow::anyhow!(format!("column not found: {}", t)))?;
-        target_indexes.push(idx);
+    let mut target_indexes: Vec<usize> = Vec::new();
+    if !is_count {
+        target_indexes.reserve(target_lowers.len());
+        for (original, lower) in targets.iter().zip(target_lowers.iter()) {
+            let idx = cols.iter().position(|c| c == lower)
+                .ok_or_else(|| anyhow::anyhow!(format!("column not found: {}", original)))?;
+            target_indexes.push(idx);
+        }
     }
+
+    let filter_idx = if let Some(f) = filter_ref {
+        Some(
+            cols.iter()
+                .position(|c| c == &f.column_lower)
+                .ok_or_else(|| anyhow::anyhow!(format!("column not found: {}", f.column_lower)))?,
+        )
+    } else {
+        None
+    };
+    let filter_spec = filter_ref.zip(filter_idx);
 
     let page_start = (rootpage - 1) * page_size;
     let mut buf = vec![0u8; page_size];
@@ -254,7 +318,9 @@ fn handle_select(select: SelectParts, db_path: &str) -> Result<()> {
     let row_cells = u16::from_be_bytes([buf[ph_off + 3], buf[ph_off + 4]]) as usize;
     let ptr_base = ph_off + PAGE_HEADER_SIZE;
 
-    let mut out_lines: Vec<String> = Vec::with_capacity(row_cells);
+    let mut serials = vec![0u64; cols.len()];
+    let mut offsets = vec![0usize; cols.len()];
+    let mut count_matches = 0u64;
 
     for i in 0..row_cells {
         let off_idx = ptr_base + i * 2;
@@ -270,38 +336,61 @@ fn handle_select(select: SelectParts, db_path: &str) -> Result<()> {
         let hdr_sz = hdr_sz as usize;
         let mut cur = hdr_next;
         let mut consumed = cur - idx;
-        let mut serials: Vec<u64> = Vec::with_capacity(cols.len());
-        while consumed < hdr_sz {
+        let mut serials_len = 0usize;
+        while consumed < hdr_sz && serials_len < serials.len() {
             let (code, nxt) = read_varint(&buf, cur);
-            serials.push(code);
+            serials[serials_len] = code;
+            serials_len += 1;
             consumed += nxt - cur;
             cur = nxt;
         }
         let body_start = cur;
 
-        // Precompute offsets for each column within the record body
-        let mut offsets: Vec<usize> = Vec::with_capacity(serials.len());
         let mut acc = 0usize;
-        for s in &serials {
-            offsets.push(acc);
-            acc += serial_type_size(*s);
+        for j in 0..serials_len {
+            offsets[j] = acc;
+            acc += serial_type_size(serials[j]);
         }
 
-        // Collect requested columns
-        let mut row_fields: Vec<String> = Vec::with_capacity(target_indexes.len());
-        for &tidx in &target_indexes {
-            let start = body_start + offsets[tidx];
-            let len = serial_type_size(serials[tidx]);
-            let bytes = &buf[start..start + len];
-            // For this stage we expect TEXT columns
-            let v = std::str::from_utf8(bytes)?.to_owned();
-            row_fields.push(v);
+        if let Some((filter, filter_idx)) = filter_spec {
+            if filter_idx >= serials_len {
+                continue;
+            }
+            let offset = offsets[filter_idx];
+            let len = serial_type_size(serials[filter_idx]);
+            let start = body_start + offset;
+            let end = start + len;
+            let value = std::str::from_utf8(&buf[start..end])?;
+            if value != filter.value {
+                continue;
+            }
         }
-        out_lines.push(row_fields.join("|"));
+
+        if is_count {
+            count_matches += 1;
+            continue;
+        }
+
+        let mut row_line = String::new();
+        for (pos, &tidx) in target_indexes.iter().enumerate() {
+            if tidx >= serials_len {
+                continue;
+            }
+            let offset = offsets[tidx];
+            let len = serial_type_size(serials[tidx]);
+            let start = body_start + offset;
+            let end = start + len;
+            let value = std::str::from_utf8(&buf[start..end])?;
+            if pos > 0 {
+                row_line.push('|');
+            }
+            row_line.push_str(value);
+        }
+        println!("{}", row_line);
     }
 
-    for line in out_lines {
-        println!("{}", line);
+    if is_count {
+        println!("{}", count_matches);
     }
 
     Ok(())

@@ -117,12 +117,12 @@ fn read_first_page(
     Ok(page)
 }
 
-struct SelectParts<'a> {
-    targets: Vec<&'a str>, // one or more column names, or ["COUNT(*)"]
-    table:   &'a str,
+struct SelectParts {
+    targets: Vec<String>, // one or more column names, or ["COUNT(*)"]
+    table:   String,
 }
 
-fn parse_select(command: &str) -> Option<SelectParts<'_>> {
+fn parse_select(command: &str) -> Option<SelectParts> {
     let mut parts = command.split_whitespace();
     let first = parts.next()?;
     if !first.eq_ignore_ascii_case("select") {
@@ -139,13 +139,13 @@ fn parse_select(command: &str) -> Option<SelectParts<'_>> {
         }
         before_from.push(tok);
     }
-    let table = table_tok?.trim_end_matches(';');
+    let table = table_tok?.trim_end_matches(';').to_string();
 
     // Targets may be split across tokens (e.g., "name,", "color"), so join & split by comma.
     let targets_joined = before_from.join(" ");
-    let mut targets: Vec<&str> = targets_joined
+    let targets: Vec<String> = targets_joined
         .split(',')
-        .map(|s| s.trim().trim_end_matches(';'))
+        .map(|s| s.trim().trim_end_matches(';').to_string())
         .filter(|s| !s.is_empty())
         .collect();
 
@@ -156,7 +156,7 @@ fn parse_select(command: &str) -> Option<SelectParts<'_>> {
     Some(SelectParts { targets, table })
 }
 
-fn handle_select(select: SelectParts<'_>, db_path: &str) -> Result<()> {
+fn handle_select(select: SelectParts, db_path: &str) -> Result<()> {
     let (mut file, header) = open_db(db_path)?;
     let page_size = page_size_from_header(&header);
     let page1 = read_first_page(&mut file, &header, page_size)?;
@@ -206,7 +206,7 @@ fn handle_select(select: SelectParts<'_>, db_path: &str) -> Result<()> {
         let sql_bytes = &page1[body_idx..body_idx + sql_len];
         let sql = std::str::from_utf8(sql_bytes)?.to_owned();
 
-        if tbl_name.eq_ignore_ascii_case(select.table) {
+        if tbl_name.eq_ignore_ascii_case(select.table.as_str()) {
             rootpage = Some(rp);
             create_sql = Some(sql);
             break;

@@ -75,83 +75,13 @@ fn main() -> Result<()> {
 
             println!("{}", output);
         }
-        cmd if cmd.to_uppercase().starts_with("SELECT") => {
-            // Very naive parser per stage instructions:
-            // Expect: SELECT COUNT(*) FROM <table>
-            let tokens: Vec<&str> = command.split_whitespace().collect();
-            let table = tokens
-                .last()
-                .map(|t| t.trim_end_matches(';'))
-                .unwrap_or("");
-            if table.is_empty() {
-                bail!("Could not parse table name");
+        _ => {
+            if let Some(select) = parse_select(command) {
+                handle_select(select, &args[1])?;
+                return Ok(());
             }
-
-            let (mut file, header) = open_db(&args[1])?;
-            let page_size = page_size_from_header(&header);
-            let page1 = read_first_page(&mut file, &header, page_size)?;
-
-            let cell_count =
-                u16::from_be_bytes([page1[HEADER_SIZE + 3], page1[HEADER_SIZE + 4]]) as usize;
-            let pointer_start = HEADER_SIZE + PAGE_HEADER_SIZE;
-            let pointer_bytes = &page1[pointer_start..pointer_start + cell_count * 2];
-
-            let mut rootpage: Option<u64> = None;
-            for ptr in pointer_bytes.chunks_exact(2) {
-                let cell_off = u16::from_be_bytes([ptr[0], ptr[1]]) as usize;
-                let mut idx = cell_off;
-
-                let (_, next) = read_varint(&page1, idx);
-                idx = next;
-                let (_, next) = read_varint(&page1, idx);
-                idx = next;
-
-                let (header_size, header_cursor) = read_varint(&page1, idx);
-                let header_end = idx + header_size as usize;
-                let (col0_serial, next) = read_varint(&page1, header_cursor);
-                let (col1_serial, next) = read_varint(&page1, next);
-                let (col2_serial, next) = read_varint(&page1, next);
-                let (col3_serial, _) = read_varint(&page1, next);
-
-                let mut body_idx = header_end;
-                body_idx += serial_type_size(col0_serial);
-                body_idx += serial_type_size(col1_serial);
-
-                let tbl_len = serial_type_size(col2_serial);
-                let tbl_bytes = &page1[body_idx..body_idx + tbl_len];
-                let tbl_name = std::str::from_utf8(tbl_bytes)?;
-                body_idx += tbl_len;
-
-                let root_len = serial_type_size(col3_serial);
-                let root_bytes = &page1[body_idx..body_idx + root_len];
-                let root = read_signed_be_int(root_bytes) as u64;
-
-                if tbl_name == table {
-                    rootpage = Some(root);
-                    break;
-                }
-            }
-
-            let rootpage = match rootpage {
-                Some(rp) => rp as usize,
-                None => {
-                    println!("0");
-                    return Ok(());
-                }
-            };
-
-            let page_start = (rootpage - 1) * page_size;
-            let mut buf = vec![0u8; page_size];
-            file.seek(SeekFrom::Start(page_start as u64))?;
-            file.read_exact(&mut buf)?;
-
-            let ph_off = if rootpage == 1 { HEADER_SIZE } else { 0 };
-            let row_count = u16::from_be_bytes([buf[ph_off + 3], buf[ph_off + 4]]) as u64;
-
-            println!("{}", row_count);
-            return Ok(());
+            bail!("Missing or invalid command passed: {}", command);
         }
-        _ => bail!("Missing or invalid command passed: {}", command),
     }
 
     Ok(())
@@ -185,6 +115,171 @@ fn read_first_page(
         file.read_exact(&mut page[HEADER_SIZE..])?;
     }
     Ok(page)
+}
+
+struct SelectParts<'a> {
+    target: &'a str,
+    table: &'a str,
+}
+
+fn parse_select(command: &str) -> Option<SelectParts<'_>> {
+    let mut parts = command.split_whitespace();
+    let first = parts.next()?;
+    if !first.eq_ignore_ascii_case("select") {
+        return None;
+    }
+    let raw_target = parts.next()?;
+    let mut table_tok = None;
+    while let Some(token) = parts.next() {
+        if token.eq_ignore_ascii_case("from") {
+            table_tok = parts.next();
+            break;
+        }
+    }
+    let table = table_tok?.trim_end_matches(';');
+    let target = raw_target.trim_end_matches(';');
+    if table.is_empty() || target.is_empty() {
+        return None;
+    }
+    Some(SelectParts { target, table })
+}
+
+fn handle_select(select: SelectParts<'_>, db_path: &str) -> Result<()> {
+    let (mut file, header) = open_db(db_path)?;
+    let page_size = page_size_from_header(&header);
+    let page1 = read_first_page(&mut file, &header, page_size)?;
+
+    let cell_count =
+        u16::from_be_bytes([page1[HEADER_SIZE + 3], page1[HEADER_SIZE + 4]]) as usize;
+    let pointer_start = HEADER_SIZE + PAGE_HEADER_SIZE;
+    let pointer_bytes = &page1[pointer_start..pointer_start + cell_count * 2];
+
+    let mut rootpage: Option<u64> = None;
+    let mut create_sql: Option<String> = None;
+    for ptr in pointer_bytes.chunks_exact(2) {
+        let cell_off = u16::from_be_bytes([ptr[0], ptr[1]]) as usize;
+        let mut idx = cell_off;
+
+        let (_, next) = read_varint(&page1, idx);
+        idx = next;
+        let (_, next) = read_varint(&page1, idx);
+        idx = next;
+
+        let (header_size, header_cursor) = read_varint(&page1, idx);
+        let header_end = idx + header_size as usize;
+        let (col0_serial, next) = read_varint(&page1, header_cursor);
+        let (col1_serial, next) = read_varint(&page1, next);
+        let (col2_serial, next) = read_varint(&page1, next);
+        let (col3_serial, next) = read_varint(&page1, next);
+        let (col4_serial, _) = read_varint(&page1, next);
+
+        let mut body_idx = header_end;
+        let type_len = serial_type_size(col0_serial);
+        let name_len = serial_type_size(col1_serial);
+        let tbl_len = serial_type_size(col2_serial);
+        let root_len = serial_type_size(col3_serial);
+        let sql_len = serial_type_size(col4_serial);
+
+        body_idx += type_len;
+        body_idx += name_len;
+
+        let tbl_bytes = &page1[body_idx..body_idx + tbl_len];
+        let tbl_name = std::str::from_utf8(tbl_bytes)?;
+        body_idx += tbl_len;
+
+        let root_bytes = &page1[body_idx..body_idx + root_len];
+        let rp = read_signed_be_int(root_bytes) as u64;
+        body_idx += root_len;
+
+        let sql_bytes = &page1[body_idx..body_idx + sql_len];
+        let sql = std::str::from_utf8(sql_bytes)?.to_owned();
+
+        if tbl_name.eq_ignore_ascii_case(select.table) {
+            rootpage = Some(rp);
+            create_sql = Some(sql);
+            break;
+        }
+    }
+
+    let rootpage = match rootpage {
+        Some(rp) => rp as usize,
+        None => {
+            if select.target.eq_ignore_ascii_case("COUNT(*)") {
+                println!("0");
+            }
+            return Ok(());
+        }
+    };
+
+    if select.target.eq_ignore_ascii_case("COUNT(*)") {
+        let page_start = (rootpage - 1) * page_size;
+        let mut buf = vec![0u8; page_size];
+        file.seek(SeekFrom::Start(page_start as u64))?;
+        file.read_exact(&mut buf)?;
+
+        let ph_off = if rootpage == 1 { HEADER_SIZE } else { 0 };
+        let row_count = u16::from_be_bytes([buf[ph_off + 3], buf[ph_off + 4]]) as u64;
+        println!("{}", row_count);
+        return Ok(());
+    }
+
+    let create_sql = create_sql.unwrap_or_default();
+    let cols = parse_columns_from_create_sql(&create_sql);
+    let col_idx = cols
+        .iter()
+        .position(|c| c.eq_ignore_ascii_case(select.target))
+        .ok_or_else(|| anyhow::anyhow!(format!("column not found: {}", select.target)))?;
+
+    let page_start = (rootpage - 1) * page_size;
+    let mut buf = vec![0u8; page_size];
+    file.seek(SeekFrom::Start(page_start as u64))?;
+    file.read_exact(&mut buf)?;
+
+    let ph_off = if rootpage == 1 { HEADER_SIZE } else { 0 };
+    let row_cells = u16::from_be_bytes([buf[ph_off + 3], buf[ph_off + 4]]) as usize;
+    let ptr_base = ph_off + PAGE_HEADER_SIZE;
+
+    let mut out_lines: Vec<String> = Vec::with_capacity(row_cells);
+
+    for i in 0..row_cells {
+        let off_idx = ptr_base + i * 2;
+        let cell_off = u16::from_be_bytes([buf[off_idx], buf[off_idx + 1]]) as usize;
+        let mut idx = cell_off;
+
+        let (_, n1) = read_varint(&buf, idx);
+        idx = n1;
+        let (_, n2) = read_varint(&buf, idx);
+        idx = n2;
+
+        let (hdr_sz, hdr_next) = read_varint(&buf, idx);
+        let hdr_sz = hdr_sz as usize;
+        let mut cur = hdr_next;
+        let mut consumed = cur - idx;
+        let mut serials: Vec<u64> = Vec::with_capacity(cols.len());
+        while consumed < hdr_sz {
+            let (code, nxt) = read_varint(&buf, cur);
+            serials.push(code);
+            consumed += nxt - cur;
+            cur = nxt;
+        }
+        let body_start = cur;
+
+        let mut body_idx = body_start;
+        for serial in &serials[..col_idx] {
+            body_idx += serial_type_size(*serial);
+        }
+        let field_size = serial_type_size(serials[col_idx]);
+        let field_bytes = &buf[body_idx..body_idx + field_size];
+
+        let val = std::str::from_utf8(field_bytes)?.to_owned();
+        out_lines.push(val);
+    }
+
+    for line in out_lines {
+        println!("{}", line);
+    }
+
+    Ok(())
 }
 
 /// Decode a SQLite varint from `buf` starting at `idx`.
@@ -237,4 +332,28 @@ fn read_signed_be_int(bytes: &[u8]) -> i64 {
     // Sign-extend if the top bit of the first byte is set
     let shift = (8 - len) * 8;
     (v << shift) >> shift
+}
+
+fn parse_columns_from_create_sql(sql: &str) -> Vec<String> {
+    // Very naive: find the first '(' ... last ')' and split by commas at the top level.
+    // Then take the first token of each segment as the column name, skipping table constraints.
+    let mut cols = Vec::new();
+    let open = match sql.find('(') { Some(i) => i, None => return cols };
+    let close = match sql.rfind(')') { Some(i) if i > open => i, _ => return cols };
+    let inner = &sql[open+1..close];
+    for raw in inner.split(',') {
+        let part = raw.trim();
+        if part.is_empty() { continue; }
+        // first token is candidate column name
+        let mut it = part.split_whitespace();
+        if let Some(tok) = it.next() {
+            let lower = tok.trim_matches(|c: char| c == '"' || c == '`' || c == '[' || c == ']').to_lowercase();
+            // skip common table constraints
+            match lower.as_str() {
+                "primary" | "foreign" | "unique" | "check" | "constraint" => continue,
+                _ => cols.push(lower),
+            }
+        }
+    }
+    cols
 }

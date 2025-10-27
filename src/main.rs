@@ -1,6 +1,10 @@
 use anyhow::{bail, Result};
 use std::fs::File;
-use std::io::Read;
+use std::io::{Read, Seek, SeekFrom};
+
+const HEADER_SIZE: usize = 100;
+const PAGE_HEADER_SIZE: usize = 8;
+const MAGIC_PREFIX: &[u8; 16] = b"SQLite format 3\0";
 
 fn main() -> Result<()> {
     // Parse arguments
@@ -15,51 +19,28 @@ fn main() -> Result<()> {
     let command = &args[2];
     match command.as_str() {
         ".dbinfo" => {
-            let mut file = File::open(&args[1])?;
-            let mut header = [0u8; 100];
-            file.read_exact(&mut header)?;
-
-            if &header[0..16] != b"SQLite format 3\0" {
-                bail!("Not a SQLite3 database (bad magic)");
-            }
-
-            let raw = u16::from_be_bytes([header[16], header[17]]);
-            let page_size = if raw == 1 { 65_536 } else { raw as u32 };
+            let (mut file, header) = open_db(&args[1])?;
+            let page_size = page_size_from_header(&header);
 
             println!("database page size: {}", page_size);
 
-            let mut page_header = [0u8; 8];
+            let mut page_header = [0u8; PAGE_HEADER_SIZE];
             file.read_exact(&mut page_header)?;
             let cell_count = u16::from_be_bytes([page_header[3], page_header[4]]);
             println!("number of tables: {}", cell_count);
         }
         ".tables" => {
-            let mut file = File::open(&args[1])?;
-            let mut header = [0u8; 100];
-            file.read_exact(&mut header)?;
+            let (mut file, header) = open_db(&args[1])?;
+            let page_size = page_size_from_header(&header);
+            let page = read_first_page(&mut file, &header, page_size)?;
 
-            if &header[0..16] != b"SQLite format 3\0" {
-                bail!("Not a SQLite3 database (bad magic)");
-            }
-
-            let raw = u16::from_be_bytes([header[16], header[17]]);
-            let page_size = if raw == 1 { 65_536usize } else { raw as usize };
-
-            let mut page = vec![0u8; page_size];
-            page[..100].copy_from_slice(&header);
-            if page_size > 100 {
-                file.read_exact(&mut page[100..])?;
-            }
-
-            let page_header_off = 100usize;
-            let cell_count =
-                u16::from_be_bytes([page[page_header_off + 3], page[page_header_off + 4]]) as usize;
-            let pointer_base = page_header_off + 8;
+            let cell_count = u16::from_be_bytes([page[HEADER_SIZE + 3], page[HEADER_SIZE + 4]]) as usize;
+            let pointer_start = HEADER_SIZE + PAGE_HEADER_SIZE;
+            let pointer_bytes = &page[pointer_start..pointer_start + cell_count * 2];
             let mut output = String::new();
 
-            for i in 0..cell_count {
-                let off_idx = pointer_base + i * 2;
-                let cell_off = u16::from_be_bytes([page[off_idx], page[off_idx + 1]]) as usize;
+            for ptr in pointer_bytes.chunks_exact(2) {
+                let cell_off = u16::from_be_bytes([ptr[0], ptr[1]]) as usize;
                 let mut idx = cell_off;
 
                 let (_, next) = read_varint(&page, idx);
@@ -94,10 +75,116 @@ fn main() -> Result<()> {
 
             println!("{}", output);
         }
+        cmd if cmd.to_uppercase().starts_with("SELECT") => {
+            // Very naive parser per stage instructions:
+            // Expect: SELECT COUNT(*) FROM <table>
+            let tokens: Vec<&str> = command.split_whitespace().collect();
+            let table = tokens
+                .last()
+                .map(|t| t.trim_end_matches(';'))
+                .unwrap_or("");
+            if table.is_empty() {
+                bail!("Could not parse table name");
+            }
+
+            let (mut file, header) = open_db(&args[1])?;
+            let page_size = page_size_from_header(&header);
+            let page1 = read_first_page(&mut file, &header, page_size)?;
+
+            let cell_count =
+                u16::from_be_bytes([page1[HEADER_SIZE + 3], page1[HEADER_SIZE + 4]]) as usize;
+            let pointer_start = HEADER_SIZE + PAGE_HEADER_SIZE;
+            let pointer_bytes = &page1[pointer_start..pointer_start + cell_count * 2];
+
+            let mut rootpage: Option<u64> = None;
+            for ptr in pointer_bytes.chunks_exact(2) {
+                let cell_off = u16::from_be_bytes([ptr[0], ptr[1]]) as usize;
+                let mut idx = cell_off;
+
+                let (_, next) = read_varint(&page1, idx);
+                idx = next;
+                let (_, next) = read_varint(&page1, idx);
+                idx = next;
+
+                let (header_size, header_cursor) = read_varint(&page1, idx);
+                let header_end = idx + header_size as usize;
+                let (col0_serial, next) = read_varint(&page1, header_cursor);
+                let (col1_serial, next) = read_varint(&page1, next);
+                let (col2_serial, next) = read_varint(&page1, next);
+                let (col3_serial, _) = read_varint(&page1, next);
+
+                let mut body_idx = header_end;
+                body_idx += serial_type_size(col0_serial);
+                body_idx += serial_type_size(col1_serial);
+
+                let tbl_len = serial_type_size(col2_serial);
+                let tbl_bytes = &page1[body_idx..body_idx + tbl_len];
+                let tbl_name = std::str::from_utf8(tbl_bytes)?;
+                body_idx += tbl_len;
+
+                let root_len = serial_type_size(col3_serial);
+                let root_bytes = &page1[body_idx..body_idx + root_len];
+                let root = read_signed_be_int(root_bytes) as u64;
+
+                if tbl_name == table {
+                    rootpage = Some(root);
+                    break;
+                }
+            }
+
+            let rootpage = match rootpage {
+                Some(rp) => rp as usize,
+                None => {
+                    println!("0");
+                    return Ok(());
+                }
+            };
+
+            let page_start = (rootpage - 1) * page_size;
+            let mut buf = vec![0u8; page_size];
+            file.seek(SeekFrom::Start(page_start as u64))?;
+            file.read_exact(&mut buf)?;
+
+            let ph_off = if rootpage == 1 { HEADER_SIZE } else { 0 };
+            let row_count = u16::from_be_bytes([buf[ph_off + 3], buf[ph_off + 4]]) as u64;
+
+            println!("{}", row_count);
+            return Ok(());
+        }
         _ => bail!("Missing or invalid command passed: {}", command),
     }
 
     Ok(())
+}
+
+fn open_db(path: &str) -> Result<(File, [u8; HEADER_SIZE])> {
+    let mut file = File::open(path)?;
+    let mut header = [0u8; HEADER_SIZE];
+    file.read_exact(&mut header)?;
+
+    if &header[..MAGIC_PREFIX.len()] != MAGIC_PREFIX {
+        bail!("Not a SQLite3 database (bad magic)");
+    }
+
+    Ok((file, header))
+}
+
+fn page_size_from_header(header: &[u8; HEADER_SIZE]) -> usize {
+    let raw = u16::from_be_bytes([header[16], header[17]]);
+    if raw == 1 { 65_536 } else { raw as usize }
+}
+
+fn read_first_page(
+    file: &mut File,
+    header: &[u8; HEADER_SIZE],
+    page_size: usize,
+) -> Result<Vec<u8>> {
+    let mut page = vec![0u8; page_size];
+    page[..HEADER_SIZE].copy_from_slice(header);
+    if page_size > HEADER_SIZE {
+        file.read_exact(&mut page[HEADER_SIZE..])?;
+    }
+    Ok(page)
 }
 
 /// Decode a SQLite varint from `buf` starting at `idx`.
@@ -137,4 +224,17 @@ fn serial_type_size(code: u64) -> usize {
         n if n >= 13 && n % 2 == 1 => ((n - 13) / 2) as usize, // TEXT
         _ => 0,
     }
+}
+
+fn read_signed_be_int(bytes: &[u8]) -> i64 {
+    // Interpret up to 8 bytes big-endian two's complement
+    let len = bytes.len();
+    if len == 0 { return 0; }
+    let mut v: i64 = 0;
+    for &b in bytes {
+        v = (v << 8) | (b as i64);
+    }
+    // Sign-extend if the top bit of the first byte is set
+    let shift = (8 - len) * 8;
+    (v << shift) >> shift
 }

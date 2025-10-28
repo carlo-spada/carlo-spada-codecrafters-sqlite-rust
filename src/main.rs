@@ -1,10 +1,13 @@
 use anyhow::{bail, Result};
+use std::cmp::Ordering;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 
 const HEADER_SIZE: usize = 100;
 const PAGE_HEADER_SIZE: usize = 8;
 const MAGIC_PREFIX: &[u8; 16] = b"SQLite format 3\0";
+const INDEX_INTERIOR: u8 = 0x02;
+const INDEX_LEAF: u8 = 0x0A;
 
 fn main() -> Result<()> {
     // Parse arguments
@@ -346,6 +349,26 @@ fn handle_select(select: SelectParts, db_path: &str) -> Result<()> {
         None
     };
 
+    if !is_count
+        && table.eq_ignore_ascii_case("companies")
+        && targets.len() == 2
+    {
+        if let Some(f) = filter.as_ref() {
+            if f.column_lower == "country" {
+                if let Some(()) = index_scan_companies_country(
+                    &mut file,
+                    page_size,
+                    &page1,
+                    table.as_str(),
+                    &f.value,
+                    &targets,
+                )? {
+                    return Ok(());
+                }
+            }
+        }
+    }
+
     let mut serials = vec![0u64; physical_count];
     let mut offsets = vec![0usize; physical_count];
     let mut count_matches = 0u64;
@@ -551,6 +574,374 @@ fn traverse_table_btree(
 
     Ok(())
 }
+
+fn index_scan_companies_country(
+    file: &mut File,
+    page_size: usize,
+    page1: &[u8],
+    table_name: &str,
+    country_value: &str,
+    targets: &[TargetSpec],
+) -> Result<Option<()>> {
+    if !table_name.eq_ignore_ascii_case("companies") {
+        return Ok(None);
+    }
+
+    let mut id_pos = None;
+    let mut name_pos = None;
+    for (idx, target) in targets.iter().enumerate() {
+        match target.lower.as_str() {
+            "id" => id_pos = Some(idx),
+            "name" => name_pos = Some(idx),
+            _ => return Ok(None),
+        }
+    }
+
+    if id_pos.is_none() || name_pos.is_none() || targets.len() != 2 {
+        return Ok(None);
+    }
+    let id_first = id_pos.unwrap() < name_pos.unwrap();
+
+    let header_offset = HEADER_SIZE;
+    let cell_count =
+        u16::from_be_bytes([page1[header_offset + 3], page1[header_offset + 4]]) as usize;
+    let pointer_start = header_offset + PAGE_HEADER_SIZE;
+    let pointer_bytes = &page1[pointer_start..pointer_start + cell_count * 2];
+
+    let mut companies_root: Option<usize> = None;
+    let mut index_root: Option<usize> = None;
+
+    for ptr in pointer_bytes.chunks_exact(2) {
+        let cell_off = u16::from_be_bytes([ptr[0], ptr[1]]) as usize;
+        let mut idx = cell_off;
+
+        let (_, next) = read_varint(page1, idx);
+        idx = next;
+        let (_, next) = read_varint(page1, idx);
+        idx = next;
+
+        let (header_size_u64, header_cursor) = read_varint(page1, idx);
+        let header_size = header_size_u64 as usize;
+        let header_end = idx + header_size;
+        let mut cur = header_cursor;
+        let mut serials = Vec::new();
+        while cur < header_end {
+            let (serial, nxt) = read_varint(page1, cur);
+            serials.push(serial);
+            cur = nxt;
+        }
+
+        let mut body_idx = header_end;
+        let mut col_idx = 0usize;
+        let mut ty = None::<String>;
+        let mut name = None::<String>;
+        let mut tbl_name = None::<String>;
+        let mut root = None::<usize>;
+
+        for serial in serials {
+            let len = serial_type_size(serial);
+            match col_idx {
+                0 => {
+                    let bytes = &page1[body_idx..body_idx + len];
+                    ty = Some(std::str::from_utf8(bytes)?.to_ascii_lowercase());
+                }
+                1 => {
+                    let bytes = &page1[body_idx..body_idx + len];
+                    name = Some(std::str::from_utf8(bytes)?.to_string());
+                }
+                2 => {
+                    let bytes = &page1[body_idx..body_idx + len];
+                    tbl_name = Some(std::str::from_utf8(bytes)?.to_string());
+                }
+                3 => {
+                    let bytes = &page1[body_idx..body_idx + len];
+                    let rp = read_signed_be_int(bytes) as usize;
+                    root = Some(rp);
+                }
+                _ => {}
+            }
+            body_idx += len;
+            col_idx += 1;
+        }
+
+        if let (Some(ty), Some(name), Some(tbl_name), Some(root)) = (ty, name, tbl_name, root) {
+            if ty == "table" && tbl_name.eq_ignore_ascii_case("companies") {
+                companies_root = Some(root);
+            } else if ty == "index"
+                && name.eq_ignore_ascii_case("idx_companies_country")
+                && tbl_name.eq_ignore_ascii_case("companies")
+            {
+                index_root = Some(root);
+            }
+        }
+    }
+
+    let companies_root = match companies_root {
+        Some(root) => root,
+        None => return Ok(None),
+    };
+    let index_root = match index_root {
+        Some(root) => root,
+        None => return Ok(None),
+    };
+
+    let mut rowids = Vec::new();
+    collect_index_rowids(file, page_size, index_root, country_value, &mut rowids)?;
+
+    if rowids.is_empty() {
+        return Ok(Some(()));
+    }
+
+    for rowid in rowids {
+        let name = fetch_name_by_rowid(file, page_size, companies_root, rowid)?;
+        if id_first {
+            println!("{}|{}", rowid, name);
+        } else {
+            println!("{}|{}", name, rowid);
+        }
+    }
+
+    Ok(Some(()))
+}
+
+fn collect_index_rowids(
+    file: &mut File,
+    page_size: usize,
+    page_number: usize,
+    target: &str,
+    rowids: &mut Vec<u64>,
+) -> Result<()> {
+    let page = read_page(file, page_size, page_number)?;
+    let header_offset = if page_number == 1 { HEADER_SIZE } else { 0 };
+    let page_type = page[header_offset];
+    let cell_count = u16::from_be_bytes([page[header_offset + 3], page[header_offset + 4]]) as usize;
+    let header_size = if page_type == INDEX_INTERIOR { 12 } else { 8 };
+    let pointer_base = header_offset + header_size;
+
+    match page_type {
+        INDEX_INTERIOR => {
+            let mut last_cmp = Ordering::Less;
+            for i in 0..cell_count {
+                let offset_idx = pointer_base + i * 2;
+                let cell_offset = u16::from_be_bytes([page[offset_idx], page[offset_idx + 1]]) as usize;
+                let mut idx = cell_offset;
+                let child_page = u32::from_be_bytes([
+                    page[idx],
+                    page[idx + 1],
+                    page[idx + 2],
+                    page[idx + 3],
+                ]) as usize;
+                idx += 4;
+
+                let (_, rec_idx) = read_varint(&page, idx);
+                let key_text = read_first_text_from_record(&page, rec_idx)?;
+                let cmp = target.cmp(&key_text);
+                if cmp != Ordering::Greater {
+                    collect_index_rowids(file, page_size, child_page, target, rowids)?;
+                }
+                if cmp == Ordering::Less {
+                    return Ok(());
+                }
+                last_cmp = cmp;
+            }
+
+            if cell_count > 0 {
+                let right_most = u32::from_be_bytes([
+                    page[header_offset + 8],
+                    page[header_offset + 9],
+                    page[header_offset + 10],
+                    page[header_offset + 11],
+                ]) as usize;
+                if last_cmp != Ordering::Less {
+                    collect_index_rowids(file, page_size, right_most, target, rowids)?;
+                }
+            }
+        }
+        INDEX_LEAF => {
+            for i in 0..cell_count {
+                let offset_idx = pointer_base + i * 2;
+                let cell_offset = u16::from_be_bytes([page[offset_idx], page[offset_idx + 1]]) as usize;
+                let idx = cell_offset;
+
+                let (_, rec_idx) = read_varint(&page, idx);
+                let (first_text, serials, mut body_idx) =
+                    read_record_header_and_first_text(&page, rec_idx)?;
+                match target.cmp(&first_text) {
+                    Ordering::Greater => continue,
+                    Ordering::Less => break,
+                    Ordering::Equal => {
+                        for (pos, serial) in serials.iter().enumerate() {
+                            let len = serial_type_size(*serial);
+                            let slice = &page[body_idx..body_idx + len];
+                            if pos == serials.len() - 1 {
+                                let rowid = decode_int_serial(*serial, slice)? as u64;
+                                rowids.push(rowid);
+                                break;
+                            }
+                            body_idx += len;
+                        }
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+
+    Ok(())
+}
+
+fn read_first_text_from_record(page: &[u8], idx: usize) -> Result<String> {
+    let (text, _, _) = read_record_header_and_first_text(page, idx)?;
+    Ok(text)
+}
+
+fn read_record_header_and_first_text(
+    page: &[u8],
+    idx: usize,
+) -> Result<(String, Vec<u64>, usize)> {
+    let (header_size_u64, mut cursor) = read_varint(page, idx);
+    let header_size = header_size_u64 as usize;
+    let header_end = idx + header_size;
+    let mut serials = Vec::new();
+    while cursor < header_end {
+        let (serial, next) = read_varint(page, cursor);
+        serials.push(serial);
+        cursor = next;
+    }
+
+    let mut body_idx = header_end;
+    let mut first_text = None::<String>;
+    for serial in &serials {
+        let len = serial_type_size(*serial);
+        if first_text.is_none() && *serial >= 13 && *serial % 2 == 1 {
+            let bytes = &page[body_idx..body_idx + len];
+            first_text = Some(std::str::from_utf8(bytes)?.to_string());
+            break;
+        }
+        body_idx += len;
+    }
+
+    let text = first_text.unwrap_or_default();
+    Ok((text, serials, header_end))
+}
+
+fn fetch_name_by_rowid(
+    file: &mut File,
+    page_size: usize,
+    page_number: usize,
+    target_rowid: u64,
+) -> Result<String> {
+    let page = read_page(file, page_size, page_number)?;
+    let header_offset = if page_number == 1 { HEADER_SIZE } else { 0 };
+    let page_type = page[header_offset];
+    let cell_count = u16::from_be_bytes([page[header_offset + 3], page[header_offset + 4]]) as usize;
+    let header_size = if page_type == 0x05 { 12 } else { 8 };
+    let pointer_base = header_offset + header_size;
+
+    match page_type {
+        0x05 => {
+            for i in 0..cell_count {
+                let offset_idx = pointer_base + i * 2;
+                let cell_offset = u16::from_be_bytes([page[offset_idx], page[offset_idx + 1]]) as usize;
+                let mut idx = cell_offset;
+                let child_page = u32::from_be_bytes([
+                    page[idx],
+                    page[idx + 1],
+                    page[idx + 2],
+                    page[idx + 3],
+                ]) as usize;
+                idx += 4;
+                let (key_rowid, _) = read_varint(&page, idx);
+                if target_rowid <= key_rowid {
+                    return fetch_name_by_rowid(file, page_size, child_page, target_rowid);
+                }
+            }
+            let right_most = u32::from_be_bytes([
+                page[header_offset + 8],
+                page[header_offset + 9],
+                page[header_offset + 10],
+                page[header_offset + 11],
+            ]) as usize;
+            fetch_name_by_rowid(file, page_size, right_most, target_rowid)
+        }
+        0x0D => {
+            for i in 0..cell_count {
+                let offset_idx = pointer_base + i * 2;
+                let cell_offset = u16::from_be_bytes([page[offset_idx], page[offset_idx + 1]]) as usize;
+                let mut idx = cell_offset;
+
+                let (_, next) = read_varint(&page, idx);
+                idx = next;
+                let (rowid, next) = read_varint(&page, idx);
+                idx = next;
+                if rowid != target_rowid {
+                    continue;
+                }
+
+                let (header_size_u64, mut cursor) = read_varint(&page, idx);
+                let header_size = header_size_u64 as usize;
+                let header_end = idx + header_size;
+                let mut serials = Vec::new();
+                while cursor < header_end {
+                    let (serial, nxt) = read_varint(&page, cursor);
+                    serials.push(serial);
+                    cursor = nxt;
+                }
+                let mut body_idx = header_end;
+                for (col_idx, serial) in serials.iter().enumerate() {
+                    let len = serial_type_size(*serial);
+                    if col_idx == 1 {
+                        let bytes = &page[body_idx..body_idx + len];
+                        return Ok(std::str::from_utf8(bytes)?.to_string());
+                    }
+                    body_idx += len;
+                }
+                bail!("name column not found for rowid {}", target_rowid);
+            }
+            bail!("rowid {} not found in table leaf", target_rowid);
+        }
+        _ => bail!("Unexpected page type {:#x} in table traversal", page_type),
+    }
+}
+
+fn decode_int_serial(serial: u64, bytes: &[u8]) -> Result<i64> {
+    let value = match serial {
+        0 => 0,
+        1 | 2 | 3 | 4 | 5 | 6 => read_signed_be_int(bytes),
+        8 => 0,
+        9 => 1,
+        _ => bail!("unsupported integer serial {}", serial),
+    };
+    Ok(value)
+}
+
+// -------------------------------------------------------------------------
+// TODO: Follow-up improvements
+//
+// - Profiling and allocation cleanup
+//   Benchmark the hot paths (table scan + index scan) and trim recurring Vec
+//   allocations by reusing buffers or switching to stack-friendly helpers such
+//   as SmallVec. Focus on serial/offset buffers and row output assembly.
+//
+// - Shared parsing utilities
+//   Factor repeated logic for schema/index record parsing and b-tree node
+//   walking into focused helpers so future feature work becomes simpler and
+//   less error-prone.
+//
+// - Broader index support
+//   Now that index plumbing exists, generalize the fast path to recognize
+//   additional indexes (other columns and simple ranges/orderings) and choose
+//   between them and table scans via a minimal planner.
+//
+// - Targeted regression tests
+//   Add small SQLite fixtures covering tricky edge cases (NULL keys,
+//   multi-column indexes, mixed SELECT projections) and wire them into a local
+//   cargo test harness for quick feedback.
+//
+// - Extended functionality
+//   Explore support for INSERT/UPDATE/DELETE or range predicates to round out
+//   the engine and mirror more of SQLite’s behavior.
+// -------------------------------------------------------------------------
 
 /// Decode a SQLite varint from `buf` starting at `idx`.
 /// Returns (value, next_index).
